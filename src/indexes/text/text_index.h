@@ -12,17 +12,21 @@
 #include <bitset>
 #include <cctype>
 #include <memory>
-#include <mutex>
 #include <optional>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/functional/function_ref.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "src/index_schema.pb.h"
 #include "src/indexes/text/invasive_ptr.h"
 #include "src/indexes/text/lexer.h"
 #include "src/indexes/text/posting.h"
+#include "src/indexes/text/rax_target_mutex_pool.h"
 #include "src/indexes/text/rax_wrapper.h"
 
 struct sb_stemmer;
@@ -69,6 +73,11 @@ class TextIndex {
   const Rax &GetPrefix() const;
   std::optional<std::reference_wrapper<Rax>> GetSuffix();
   std::optional<std::reference_wrapper<const Rax>> GetSuffix() const;
+
+  // Applies target mutation to both prefix tree for |word| and, if the index
+  // has a suffix tree, to the suffix tree for reverse(word).
+  void MutateTarget(absl::string_view word, const InvasivePtr<Postings> &target,
+                    item_count_op op = NONE);
 
  private:
   Rax prefix_tree_;
@@ -121,6 +130,8 @@ class TextIndexSchema {
     text_index_ = std::make_shared<TextIndex>(true);
   }
 
+  void EnableSubtreeItemCountTracking() { track_subtree_item_counts_ = true; }
+
  private:
   uint8_t num_text_fields_ = 0;
 
@@ -132,9 +143,10 @@ class TextIndexSchema {
   //
   std::shared_ptr<TextIndex> text_index_ = std::make_shared<TextIndex>(false);
 
-  // Prevent concurrent mutations to schema-level text index
-  // TODO: develop a finer-grained TextIndex locking scheme
-  std::mutex text_index_mutex_;
+  // Guards rax tree structural changes during concurrent writes.
+  // Used exclusively by CommitKeyData/DeleteKeyData when inserting or removing
+  // tree nodes.
+  mutable absl::Mutex text_index_mutex_;
 
   //
   // Stem tree: maps stem roots to their parent words
@@ -142,8 +154,11 @@ class TextIndexSchema {
   //
   Rax stem_tree_;
 
-  // Prevent concurrent mutations to stem tree
-  std::mutex stem_tree_mutex_;
+  // Guards structural changes to stem_tree_.
+  mutable absl::Mutex stem_tree_mutex_;
+
+  // Per-word bucket locks for concurrent Rax target updates.
+  RaxTargetMutexPool rax_target_mutex_pool_;
 
   //
   // To support the Delete record and the post-filtering case, there is a
@@ -190,11 +205,17 @@ class TextIndexSchema {
   // IndexSchema::stem_text_field_mask_)
   uint64_t stem_text_field_mask_ = 0;
 
+  // We track subtree items if the index has a HNSW field to enable filtering
+  // planning decisions with prefix/suffix text filtering.
+  bool track_subtree_item_counts_ = false;
+
  public:
-  // FT.INFO memory stats for text index
+  // FT.INFO stats for text index
   uint64_t GetTotalPositions() const;
   uint64_t GetNumUniqueTerms() const;
   uint64_t GetTotalTermFrequency() const;
+  // TODO: Implement the following APIs when we want granular memory metrics for
+  // text index components
   uint64_t GetPostingsMemoryUsage() const;
   uint64_t GetRadixTreeMemoryUsage() const;
   uint64_t GetPositionMemoryUsage() const;
@@ -215,6 +236,10 @@ class TextIndexSchema {
     return per_key_text_indexes_;
   }
 
+  // Total number of keys with text fields indexed in this schema.
+  // No locking needed because only called from read phase.
+  size_t GetTrackedKeyCount() const { return per_key_text_indexes_.size(); }
+
   // Helper function to lookup text index for a key
   static const TextIndex *LookupTextIndex(
       const absl::node_hash_map<Key, TextIndex> &per_key_indexes,
@@ -228,6 +253,11 @@ class TextIndexSchema {
     }
     // Key not found in text indexes - this is normal for keys without text data
     return nullptr;
+  }
+
+  // TODO: remove this because we'll always track the counts once it's optimized
+  bool TrackSubtreeItemsCountEnabled() const {
+    return track_subtree_item_counts_;
   }
 };
 
